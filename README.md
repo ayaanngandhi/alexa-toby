@@ -73,6 +73,8 @@ Echo Dot  --voice-->  Amazon Alexa  --HTTPS POST-->  your endpoint  --HTTPS-->  
 | `PORT` | `8432` | port the HTTP server binds |
 | `ENV_FILE` | `~/.env` | file the key is read from when the variable is not set |
 | `SKILL_ID` | empty | if set, requests from any other Alexa skill id are rejected with HTTP 400 |
+| `API_KEY` | empty | shared secret accepted in an `X-Api-Key` header for your own scripts and uptime checks |
+| `ENFORCE_SIGNATURE` | `0` | when truthy (`1`, `true`, `yes`, `on`), reject requests that are neither signed by Amazon nor carrying a valid `X-Api-Key` |
 
 ## Connecting it to Alexa
 
@@ -90,12 +92,27 @@ Echo Dot  --voice-->  Amazon Alexa  --HTTPS POST-->  your endpoint  --HTTPS-->  
 
 ## Security notes
 
-- The endpoint verifies the Alexa skill id when `SKILL_ID` is set.
+- Requests are authenticated in one of two ways: a valid Amazon request signature, or an `X-Api-Key` header matching `API_KEY`.
+- Amazon does not send custom headers, so an API key cannot be used to gate genuine Alexa traffic. Signature verification is the protocol-level equivalent and is the mechanism used for real Alexa requests.
+- Signature verification validates the certificate URL against `s3.amazonaws.com/echo.api/`, checks that the certificate covers `echo-api.amazon.com`, verifies the signature over the raw request body, and rejects requests whose `request.timestamp` is more than 150 seconds out of date.
+- `SKILL_ID` additionally pins the endpoint to a single skill.
+- The certificate chain is only checked for hostname, validity and signature. The chain is **not** validated against a pinned root CA beyond what `openssl` does by default.
 - Speech output is sanitised and length-capped.
 - The model call has a hard timeout and falls back to a spoken apology rather than erroring.
 - The API key is read from the environment or a dotenv file and is never logged or echoed.
 
-Request-signature verification against Amazon's certificate chain is **not** implemented. If the endpoint is exposed publicly, set `SKILL_ID` and consider adding it.
+### Rolling out enforcement
+
+Leave `ENFORCE_SIGNATURE=0` for the first day. Requests that carry Amazon's signature headers are
+still verified, but a failure is logged and allowed through rather than rejected, so a bug in the
+verifier cannot take the skill offline. Watch the log for `signature verification failed (soft mode)`:
+
+```sh
+journalctl --user -u alexa-toby.service -f | grep -i signature
+```
+
+Once real Alexa traffic is arriving with no soft-mode warnings, set `ENFORCE_SIGNATURE=1` and
+restart. From then on anything unsigned is rejected with `401`.
 
 ## Limitations
 
