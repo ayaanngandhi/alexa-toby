@@ -18,6 +18,8 @@ Echo Dot  --voice-->  Amazon Alexa  --HTTPS POST-->  your endpoint  --HTTPS-->  
 
 - The skill receives transcribed text only, never raw audio.
 - The reply must arrive within 8 seconds.
+- For live or recent information the model can call a `web_search` tool. Search uses DuckDuckGo HTML with an Instant Answer API fallback and a five-minute cache, because DuckDuckGo rate-limits by IP and answers with a captcha page rather than an error.
+- Because the budget is 8 seconds, there is exactly **one** tool round. If less than 2.5 seconds remain after the model asks to search, the search is skipped and the model answers from memory instead.
 - The endpoint must be public HTTPS with a CA-trusted certificate. A Cloudflare Tunnel is the documented approach.
 
 ## Requirements

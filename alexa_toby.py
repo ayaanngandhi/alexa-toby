@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import base64
 import datetime
+import html
 import json
 import os
 import re
@@ -30,6 +31,36 @@ MODEL_URL = (
 )
 FALLBACK = "Sorry, I could not reach my brain just now. Please try again."
 SPEECH_LIMIT = 7800
+
+MODEL_TIMEOUT = 5.5
+SEARCH_TIMEOUT = 2.5
+SEARCH_CACHE_TTL = 300
+SEARCH_CACHE_MAX = 100
+SEARCH_RESULT_LIMIT = 5
+SEARCH_TEXT_LIMIT = 2000
+TOOL_SKIP_WINDOW = 2.5
+SEARCH_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+WEB_SEARCH_TOOL = {
+    "functionDeclarations": [
+        {
+            "name": "web_search",
+            "description": "Search the web for current, live or recent information.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": {
+                        "type": "STRING",
+                        "description": "The search query.",
+                    }
+                },
+                "required": ["query"],
+            },
+        }
+    ]
+}
 
 CERT_HOST = "s3.amazonaws.com"
 CERT_PATH_PREFIX = "/echo.api/"
@@ -66,6 +97,10 @@ LOG_LOCK = threading.Lock()
 # Downloaded certificate chains, keyed by URL, with a monotonic expiry.
 CHAIN_CACHE = {}
 CHAIN_CACHE_LOCK = threading.Lock()
+
+# Recent search results, keyed by normalised query, with a monotonic timestamp.
+SEARCH_CACHE = {}
+SEARCH_CACHE_LOCK = threading.Lock()
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -123,21 +158,201 @@ def speech_response(speech="", end_session=True, reprompt=""):
     return {"version": "1.0", "response": response}
 
 
-def ask_model(question, deadline, locale="en-IN"):
-    """Ask Gemma for an answer, returning the fallback line on any failure."""
-    system = SYSTEM_PROMPT
-    if locale.lower().startswith("hi"):
-        system += "\n\n## Language\n- The speaker is in Hindi mode. Reply in Hindi, in Devanagari."
+def _strip_tags(value):
+    """Turn an HTML fragment into plain text."""
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
 
-    payload = {
-        "systemInstruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": question}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 500,
-            "thinkingConfig": {"thinkingLevel": "minimal"},
+
+def _normalise_query(query):
+    """Collapse a query to the form used as the cache key."""
+    return re.sub(r"\s+", " ", (query or "").strip().lower())
+
+
+def _search_cache_get(key):
+    """Return cached results for key when they are still fresh, else None."""
+    now = time.monotonic()
+    with SEARCH_CACHE_LOCK:
+        cached = SEARCH_CACHE.get(key)
+        if not cached:
+            return None
+        if now - cached[1] < SEARCH_CACHE_TTL:
+            return list(cached[0])
+        del SEARCH_CACHE[key]
+    return None
+
+
+def _search_cache_put(key, results):
+    """Store results, evicting the oldest entry once the cache is full."""
+    with SEARCH_CACHE_LOCK:
+        SEARCH_CACHE.pop(key, None)
+        while len(SEARCH_CACHE) >= SEARCH_CACHE_MAX:
+            oldest = min(SEARCH_CACHE, key=lambda item: SEARCH_CACHE[item][1])
+            del SEARCH_CACHE[oldest]
+        SEARCH_CACHE[key] = (list(results), time.monotonic())
+
+
+def _fetch_text(url, timeout=SEARCH_TIMEOUT):
+    """GET a URL with browser-like headers and return decoded text."""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": SEARCH_USER_AGENT,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
         },
-    }
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read(400_000).decode("utf-8", "replace")
+
+
+def _search_html(query):
+    """Parse DuckDuckGo's HTML results, returning [] when blocked or empty."""
+    try:
+        body = _fetch_text(
+            "https://html.duckduckgo.com/html/?q="
+            + urllib.parse.quote_plus(query)
+        )
+    except Exception:
+        return []
+
+    lowered = body.lower()
+    if "anomaly" in lowered or "captcha" in lowered or "challenge" in lowered:
+        return []
+
+    titles = re.findall(
+        r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>',
+        body,
+        re.DOTALL | re.IGNORECASE,
+    )
+    snippets = re.findall(
+        r'<(?:a|div)[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>',
+        body,
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    results = []
+    for index, title_html in enumerate(titles[:SEARCH_RESULT_LIMIT]):
+        title = _strip_tags(title_html)
+        snippet = (
+            _strip_tags(snippets[index]) if index < len(snippets) else ""
+        )
+        if title or snippet:
+            results.append((title or "Result", snippet))
+    return results
+
+
+def _first_related_text(topics):
+    """Return the first Text value from a RelatedTopics tree."""
+    if not isinstance(topics, list):
+        return ""
+    for topic in topics:
+        if not isinstance(topic, dict):
+            continue
+        text = topic.get("Text")
+        if text:
+            return str(text)
+        nested = _first_related_text(topic.get("Topics"))
+        if nested:
+            return nested
+    return ""
+
+
+def _search_api(query):
+    """Use DuckDuckGo's Instant Answer API as a single-result fallback."""
+    url = (
+        "https://api.duckduckgo.com/?q="
+        + urllib.parse.quote_plus(query)
+        + "&format=json&no_html=1&skip_disambig=1"
+    )
+    try:
+        data = json.loads(_fetch_text(url))
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    text = data.get("Answer") or data.get("AbstractText")
+    if not text:
+        text = _first_related_text(data.get("RelatedTopics"))
+    text = _strip_tags(str(text)) if text else ""
+    if not text:
+        return []
+
+    title = _strip_tags(str(data.get("Heading") or "Web result"))
+    return [(title, text)]
+
+
+def web_search(query):
+    """Return up to five (title, snippet) results, or [] on total failure."""
+    key = _normalise_query(query)
+    if not key:
+        return []
+
+    cached = _search_cache_get(key)
+    if cached is not None:
+        return cached
+
+    clean_query = re.sub(r"\s+", " ", (query or "").strip())
+    results = _search_html(clean_query) or _search_api(clean_query)
+    _search_cache_put(key, results)
+    return results
+
+
+def _format_results(results):
+    """Build the compact numbered list handed back to the model."""
+    lines = []
+    total = 0
+    for index, item in enumerate(results[:SEARCH_RESULT_LIMIT], 1):
+        title, snippet = item
+        body = " — ".join(value for value in (title, snippet) if value)
+        line = f"{index}. {body}".strip()
+        if not line:
+            continue
+        if total + len(line) + 1 > SEARCH_TEXT_LIMIT:
+            break
+        lines.append(line)
+        total += len(line) + 1
+    return "\n".join(lines)[:SEARCH_TEXT_LIMIT]
+
+
+def _model_parts(parsed):
+    """Return the parts of the first candidate, tolerating any bad shape."""
+    try:
+        parts = parsed["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError, TypeError):
+        return []
+    return parts if isinstance(parts, list) else []
+
+
+def _model_content(parsed):
+    """Return the first candidate's content turn, tagged as the model."""
+    try:
+        content = parsed["candidates"][0]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not isinstance(content, dict):
+        return None
+    if not content.get("role"):
+        content = dict(content)
+        content["role"] = "model"
+    return content
+
+
+def _model_call(payload, deadline):
+    """POST one payload to Gemini, returning parsed JSON or None on failure."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.2:
+        print(
+            "[alexa-toby] deadline exceeded during model call",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
     data = json.dumps(payload).encode("utf-8")
     url = MODEL_URL + "?key=" + urllib.parse.quote(GEMINI_API_KEY, safe="")
     request = urllib.request.Request(
@@ -148,25 +363,11 @@ def ask_model(question, deadline, locale="en-IN"):
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=5.5) as response:
+        with urllib.request.urlopen(
+            request, timeout=min(MODEL_TIMEOUT, remaining)
+        ) as response:
             raw = response.read()
-
-        parsed = json.loads(raw.decode("utf-8"))
-        parts = parsed["candidates"][0]["content"]["parts"]
-
-        chunks = []
-        for part in parts:
-            # Reasoning parts must never be spoken aloud.
-            if part.get("thought"):
-                continue
-            value = part.get("text")
-            if value:
-                chunks.append(value)
-
-        answer = " ".join(chunks).strip()
-        if not answer:
-            raise ValueError("model returned no usable text")
-        return answer
+        return json.loads(raw.decode("utf-8"))
 
     except (
         urllib.error.HTTPError,
@@ -176,14 +377,14 @@ def ask_model(question, deadline, locale="en-IN"):
         json.JSONDecodeError,
     ) as exc:
         print(f"[alexa-toby] model call failed: {exc!r}", file=sys.stderr, flush=True)
-        return FALLBACK
+        return None
     except Exception as exc:  # Safety net: the handler must never raise.
         print(
             f"[alexa-toby] unexpected model error: {exc!r}",
             file=sys.stderr,
             flush=True,
         )
-        return FALLBACK
+        return None
     finally:
         if time.monotonic() > deadline:
             print(
@@ -191,6 +392,120 @@ def ask_model(question, deadline, locale="en-IN"):
                 file=sys.stderr,
                 flush=True,
             )
+
+
+def ask_model(question, deadline, locale="en-IN"):
+    """Ask Gemma for an answer, allowing one web-search round.
+
+    Returns (answer, tool_used, search_query).
+    """
+    tool_used = False
+    search_query = ""
+
+    system = SYSTEM_PROMPT
+    if locale.lower().startswith("hi"):
+        system += "\n\n## Language\n- The speaker is in Hindi mode. Reply in Hindi, in Devanagari."
+
+    generation = {
+        "temperature": 0.2,
+        "maxOutputTokens": 500,
+        "thinkingConfig": {"thinkingLevel": "minimal"},
+    }
+    user_turn = {"role": "user", "parts": [{"text": question}]}
+    payload = {
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [user_turn],
+        "generationConfig": generation,
+        "tools": [WEB_SEARCH_TOOL],
+    }
+
+    parsed = _model_call(payload, deadline)
+    if parsed is None:
+        return FALLBACK, tool_used, search_query
+
+    function_call = None
+    text_chunks = []
+    for part in _model_parts(parsed):
+        if not isinstance(part, dict):
+            continue
+        call = part.get("functionCall")
+        if (
+            isinstance(call, dict)
+            and call.get("name") == "web_search"
+            and function_call is None
+        ):
+            function_call = call
+        if part.get("thought"):
+            continue
+        value = part.get("text")
+        if value:
+            text_chunks.append(value)
+    round1_text = " ".join(text_chunks).strip()
+
+    if function_call is None:
+        return (round1_text or FALLBACK), tool_used, search_query
+
+    tool_used = True
+    args = function_call.get("args")
+    if isinstance(args, dict):
+        search_query = str(args.get("query") or "").strip()
+
+    if not search_query or deadline - time.monotonic() < TOOL_SKIP_WINDOW:
+        return (round1_text or FALLBACK), tool_used, search_query
+
+    results = web_search(search_query)
+    results_text = _format_results(results)
+    if not results_text:
+        results_text = "No search results were found."
+
+    if deadline - time.monotonic() <= 0.5:
+        return (round1_text or FALLBACK), tool_used, search_query
+
+    model_turn = _model_content(parsed) or {
+        "role": "model",
+        "parts": [{"functionCall": function_call}],
+    }
+    payload2 = {
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [
+            user_turn,
+            model_turn,
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "name": "web_search",
+                            "response": {"result": results_text},
+                        }
+                    },
+                    {
+                        "text": (
+                            "Answer the user's question now using these results. "
+                            "One or two short spoken sentences, no lists or URLs."
+                        )
+                    },
+                ],
+            },
+        ],
+        "generationConfig": generation,
+        "tools": [WEB_SEARCH_TOOL],
+        "toolConfig": {"functionCallingConfig": {"mode": "NONE"}},
+    }
+
+    parsed2 = _model_call(payload2, deadline)
+    if parsed2 is None:
+        return (round1_text or FALLBACK), tool_used, search_query
+
+    answer_chunks = []
+    for part in _model_parts(parsed2):
+        if not isinstance(part, dict) or part.get("thought"):
+            continue
+        value = part.get("text")
+        if value:
+            answer_chunks.append(value)
+    answer = " ".join(answer_chunks).strip()
+    return (answer or FALLBACK), tool_used, search_query
 
 
 def _run_openssl(args, timeout=3.0):
@@ -463,14 +778,27 @@ class AlexaHandler(BaseHTTPRequestHandler):
         except (ConnectionError, OSError):
             return b""
 
-    def _log_request(self, req_type, intent_name, question, start, answer_len):
+    def _log_request(
+        self,
+        req_type,
+        intent_name,
+        question,
+        start,
+        answer_len,
+        tool_used=False,
+        search_query="",
+    ):
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
         elapsed = time.monotonic() - start
         snippet = (question or "").replace("\n", " ")[:80]
         line = (
             f"{timestamp} type={req_type or '-'} intent={intent_name or '-'} "
-            f"q={snippet!r} elapsed={elapsed:.2f}s answer_len={answer_len}"
+            f"q={snippet!r} elapsed={elapsed:.2f}s answer_len={answer_len} "
+            f"tool={'yes' if tool_used else 'no'}"
         )
+        if tool_used:
+            query_snippet = (search_query or "").replace("\n", " ")[:80]
+            line += f" wq={query_snippet!r}"
         with LOG_LOCK:
             print(line, flush=True)
 
@@ -537,6 +865,8 @@ class AlexaHandler(BaseHTTPRequestHandler):
         intent_name = "-"
         question = ""
         answer_len = 0
+        tool_used = False
+        tool_search_query = ""
 
         try:
             if req_type == "LaunchRequest":
@@ -565,7 +895,9 @@ class AlexaHandler(BaseHTTPRequestHandler):
                     if not question:
                         result = speech_response("I did not catch the question.", True)
                     else:
-                        answer = ask_model(question, deadline, locale)
+                        answer, tool_used, tool_search_query = ask_model(
+                            question, deadline, locale
+                        )
                         speech = sanitise(answer)
                         answer_len = len(speech)
                         result = speech_response(speech, True)
@@ -591,7 +923,15 @@ class AlexaHandler(BaseHTTPRequestHandler):
             answer_len = len(FALLBACK)
 
         self._send_json(200, result)
-        self._log_request(req_type, intent_name, question, start, answer_len)
+        self._log_request(
+            req_type,
+            intent_name,
+            question,
+            start,
+            answer_len,
+            tool_used,
+            tool_search_query,
+        )
 
     def do_HEAD(self):
         self._not_found()
