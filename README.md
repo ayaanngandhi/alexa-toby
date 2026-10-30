@@ -4,6 +4,10 @@ A self-hosted backend that lets an Amazon Alexa custom skill answer questions wi
 
 You cannot replace the conversation agent inside an Echo, because the speech recognition and language understanding run in Amazon's cloud. A custom skill is the supported way to substitute the brain while keeping the wake word, Drop In and Announcements intact.
 
+> **Full setup guide:** [docs/setup.md](docs/setup.md) — step-by-step instructions, the certificate
+> trap that silently breaks everything, Hindi and other languages, and how this specific deployment
+> is configured.
+
 ## How it works
 
 ```
@@ -81,10 +85,12 @@ Echo Dot  --voice-->  Amazon Alexa  --HTTPS POST-->  your endpoint  --HTTPS-->  
 1. Create a skill in the Alexa developer console, choosing "Custom" and "Provision your own".
 2. Paste `interaction_model.json` into the Interaction Model JSON editor and build it.
 3. Set the endpoint to your HTTPS URL ending in `/alexa`.
-4. Enable testing.
+4. Choose the correct certificate option — see below.
+5. Enable testing.
 
 ### Gotchas
 
+- **Wildcard certificates.** If your certificate is a wildcard such as Cloudflare's `*.example.com`, you must select "has a wildcard certificate from a certificate authority". Choosing "trusted certificate authority" instead makes Amazon reject the connection during TLS validation: Alexa says *"unable to reach the requested skill"* and **not one request reaches your server**. See [docs/setup.md](docs/setup.md#5-the-certificate-trap-read-this).
 - A development-stage skill only runs on Echo devices registered to the **same Amazon account** as the developer account. Mismatched accounts fail in a way that looks exactly like a broken endpoint.
 - Amazon rejects invocation names that are a single word, so `toby` will not save; use two words.
 - Every interaction-model sample needs a carrier phrase such as "tell me". Alexa absorbs the carrier, so the server receives a fragment like "the boiling point of tungsten" rather than a full question. The system prompt accounts for this.

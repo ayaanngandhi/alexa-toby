@@ -43,7 +43,8 @@ SYSTEM_PROMPT = '''You are Toby, a voice assistant in a smart speaker. Your repl
 Speech recognition may deliver a fragment rather than a question. Infer the intent and answer it.
 
 ## Voice
-- One or two short sentences, plain spoken English
+- One or two short sentences, plain spoken words
+- Answer in the language the question is asked in. A Hindi question gets a Hindi answer in Devanagari.
 - No markdown, bullets, headings, emoji, parentheses or symbols
 - Speak numbers the way a person would; never read out URLs, code or long digit strings
 - Answer directly; never open with "Sure", "Certainly" or a restatement of the question
@@ -122,13 +123,17 @@ def speech_response(speech="", end_session=True, reprompt=""):
     return {"version": "1.0", "response": response}
 
 
-def ask_model(question, deadline):
+def ask_model(question, deadline, locale="en-IN"):
     """Ask Gemma for an answer, returning the fallback line on any failure."""
+    system = SYSTEM_PROMPT
+    if locale.lower().startswith("hi"):
+        system += "\n\n## Language\n- The speaker is in Hindi mode. Reply in Hindi, in Devanagari."
+
     payload = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": question}]}],
         "generationConfig": {
-            "temperature": 0.3,
+            "temperature": 0.2,
             "maxOutputTokens": 500,
             "thinkingConfig": {"thinkingLevel": "minimal"},
         },
@@ -388,7 +393,7 @@ def authorize(headers, body_bytes):
         return True, 200, "api-key"
 
     cert_url = headers.get("SignatureCertChainUrl")
-    signature = headers.get("Signature")
+    signature = headers.get("Signature") or headers.get("Signature-256")
     if cert_url and signature:
         ok, reason = verify_amazon_signature(cert_url, signature, body_bytes)
         if ok:
@@ -528,6 +533,7 @@ class AlexaHandler(BaseHTTPRequestHandler):
         if not isinstance(request, dict):
             request = {}
         req_type = request.get("type") or ""
+        locale = request.get("locale") or "en-IN"
         intent_name = "-"
         question = ""
         answer_len = 0
@@ -559,7 +565,7 @@ class AlexaHandler(BaseHTTPRequestHandler):
                     if not question:
                         result = speech_response("I did not catch the question.", True)
                     else:
-                        answer = ask_model(question, deadline)
+                        answer = ask_model(question, deadline, locale)
                         speech = sanitise(answer)
                         answer_len = len(speech)
                         result = speech_response(speech, True)

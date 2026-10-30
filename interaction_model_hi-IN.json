@@ -1,0 +1,33 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "टोबी असिस्टेंट",
+      "intents": [
+        {
+          "name": "AskIntent",
+          "slots": [{"name": "question", "type": "AMAZON.SearchQuery"}],
+          "samples": [
+            "पूछो {question}",
+            "बताओ {question}",
+            "बताइए {question}",
+            "क्या है {question}",
+            "क्या होता है {question}",
+            "कौन है {question}",
+            "कैसे होता है {question}",
+            "क्यों होता है {question}",
+            "कहाँ है {question}",
+            "कब हुआ {question}",
+            "समझाओ {question}",
+            "जानकारी दो {question}"
+          ]
+        },
+        {"name": "AMAZON.FallbackIntent", "samples": []},
+        {"name": "AMAZON.HelpIntent", "samples": []},
+        {"name": "AMAZON.CancelIntent", "samples": []},
+        {"name": "AMAZON.StopIntent", "samples": []},
+        {"name": "AMAZON.NavigateHomeIntent", "samples": []}
+      ],
+      "types": []
+    }
+  }
+}

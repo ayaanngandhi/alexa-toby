@@ -1,7 +1,7 @@
 {
   "interactionModel": {
     "languageModel": {
-      "invocationName": "toby ai",
+      "invocationName": "toby assistant",
       "intents": [
         {
           "name": "AskIntent",
