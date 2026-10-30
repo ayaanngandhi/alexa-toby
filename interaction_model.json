@@ -1,0 +1,36 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "toby ai",
+      "intents": [
+        {
+          "name": "AskIntent",
+          "slots": [{"name": "question", "type": "AMAZON.SearchQuery"}],
+          "samples": [
+            "ask {question}",
+            "tell me {question}",
+            "tell me about {question}",
+            "what is {question}",
+            "what are {question}",
+            "what do you know about {question}",
+            "who is {question}",
+            "how do I {question}",
+            "how does {question}",
+            "why is {question}",
+            "why do {question}",
+            "when did {question}",
+            "where is {question}",
+            "explain {question}",
+            "search for {question}"
+          ]
+        },
+        {"name": "AMAZON.FallbackIntent", "samples": []},
+        {"name": "AMAZON.HelpIntent", "samples": []},
+        {"name": "AMAZON.CancelIntent", "samples": []},
+        {"name": "AMAZON.StopIntent", "samples": []},
+        {"name": "AMAZON.NavigateHomeIntent", "samples": []}
+      ],
+      "types": []
+    }
+  }
+}
